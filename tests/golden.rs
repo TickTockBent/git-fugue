@@ -156,7 +156,7 @@ fn build_history_fixture(dir: &Path) {
     sh_env(
         dir,
         "git",
-        &["merge", "-q", "--no-ff", "-m", "merge feature", "feature"],
+        &["merge", "-q", "--no-ff", "-m", "Merge branch 'feature'", "feature"],
         &[
             ("GIT_AUTHOR_NAME", "Alice"),
             ("GIT_AUTHOR_EMAIL", "alice@example.com"),
@@ -168,6 +168,36 @@ fn build_history_fixture(dir: &Path) {
     );
     // A long quiet stretch, then one more change: exercises the breath.
     commit("util.py", "def helper(x):\n    return x * 3\n", "tune helper", bob, t0 + 66 * day);
+
+    // A branch that edits the same line main just changed: merging it
+    // conflicts, exercising the merge-tree suspension bar.
+    sh(dir, "git", &["checkout", "-q", "-b", "hotfix", "HEAD~1"]);
+    commit("util.py", "def helper(x):\n    return x * 9\n", "hotfix helper", bob, t0 + 67 * day);
+    sh(dir, "git", &["checkout", "-q", "main"]);
+    let cdate = format!("{} +0000", t0 + 68 * day);
+    // The merge itself fails on the conflict; resolve and commit.
+    let _ = Command::new("git")
+        .current_dir(dir)
+        .args(["merge", "-q", "--no-ff", "-m", "Merge branch 'hotfix'", "hotfix"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("util.py"), "def helper(x):\n    return x * 27\n").unwrap();
+    sh(dir, "git", &["add", "-A"]);
+    sh_env(
+        dir,
+        "git",
+        &["commit", "-q", "-m", "Merge branch 'hotfix'"],
+        &[
+            ("GIT_AUTHOR_NAME", "Alice"),
+            ("GIT_AUTHOR_EMAIL", "alice@example.com"),
+            ("GIT_AUTHOR_DATE", &cdate),
+            ("GIT_COMMITTER_NAME", "Fixture"),
+            ("GIT_COMMITTER_EMAIL", "fixture@gitfugue.test"),
+            ("GIT_COMMITTER_DATE", &cdate),
+        ],
+    );
 }
 
 fn render_history(repo: &Path, out: &Path) -> Vec<u8> {
@@ -227,8 +257,10 @@ fn history_liner_notes_name_the_players() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("alice@example.com ->"), "missing alice voice line:\n{text}");
     assert!(text.contains("dependabot[bot] -> hi-hat"), "missing bot percussion line:\n{text}");
-    assert!(text.contains("merge"), "missing merge event line:\n{text}");
+    assert!(text.contains("enters (feature"), "missing fugal entry line:\n{text}");
+    assert!(text.contains("merge feature"), "missing merge event line:\n{text}");
     assert!(text.contains("breath"), "missing breath (gap) line:\n{text}");
+    assert!(text.contains("conflict"), "missing conflict tension line:\n{text}");
 }
 
 #[test]

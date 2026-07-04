@@ -60,13 +60,23 @@ pub fn render_midi(score: &Score) -> Result<Vec<u8>> {
     // One track per voice.
     for (vi, voice) in score.voices.iter().enumerate() {
         let ch = u4::from(voice.channel);
-        // (tick, order, kind): order 0 = note-off, 1 = note-on, so
-        // repeated pitches never produce stuck notes.
+        // (tick, order, kind): order 0 = note-off, 1 = program change,
+        // 2 = note-on, so repeated pitches never stick and timbre
+        // switches land before the notes they color.
         let mut moments: Vec<(u32, u8, MidiMessage)> = Vec::new();
+        for (tick, _, program) in score.program_changes.iter().filter(|(_, v, _)| *v == vi) {
+            moments.push((
+                *tick,
+                1,
+                MidiMessage::ProgramChange {
+                    program: u7::from((*program).min(127)),
+                },
+            ));
+        }
         for e in score.events.iter().filter(|e| e.voice == vi) {
             moments.push((
                 e.start,
-                1,
+                2,
                 MidiMessage::NoteOn {
                     key: u7::from(e.pitch.min(127)),
                     vel: u7::from(e.velocity.min(127)),
@@ -148,6 +158,7 @@ mod tests {
                 NoteEvent { voice: 0, pitch: 64, start: 480, dur: 480, velocity: 80 },
             ],
             tempo_map: vec![(0, 90)],
+            program_changes: vec![],
             liner_notes: vec![],
             seed: 42,
         }

@@ -110,18 +110,36 @@ pub struct Author {
     pub is_bot: bool,
 }
 
+/// Sentinel lane for branches folded into the shared ensemble voice.
+pub const LANE_ENSEMBLE: u8 = u8::MAX;
+
 #[derive(Debug, Clone)]
 pub struct CommitNode {
     /// First 64 bits of the commit oid: the per-commit mutation seed
     /// (spec §4.1).
     pub hash: u64,
     pub short: String,
+    /// Indices into the commit vec; first entry is the first parent.
+    /// Parents outside the rendered window are dropped.
+    pub parents: Vec<usize>,
     pub author_id: usize,
     pub timestamp: i64,
     pub diff_magnitude: u32,
     pub is_merge: bool,
     /// How many raw commits this bar represents (>1 under compression).
     pub folded: u32,
+    /// Voice lane assigned by the allocator (LANE_ENSEMBLE = folded).
+    pub lane: u8,
+    /// True on the first commit of a new lane: the fugal entry.
+    pub opens_lane: bool,
+    /// A merge that consumed this source lane (the voice releases).
+    pub closes_lane: Option<u8>,
+    /// Branch label recovered from the eventual merge subject.
+    pub fork_name: Option<String>,
+    /// The merge would have conflicted (git merge-tree).
+    pub conflicted: bool,
+    /// Opening this lane evicted another branch to the ensemble.
+    pub evicted_lane: Option<u8>,
 }
 
 /// Mode-specific input to the composer.
@@ -221,6 +239,10 @@ pub struct Score {
     pub voices: Vec<Voice>,
     pub events: Vec<NoteEvent>,
     pub tempo_map: Vec<(Tick, u16)>,
+    /// Mid-piece timbre changes: (tick, voice, GM program). History
+    /// mode uses these so one lane speaks in each commit author's
+    /// instrument (spec §6.3).
+    pub program_changes: Vec<(Tick, usize, u8)>,
     pub liner_notes: Vec<String>,
     pub seed: u64,
 }

@@ -49,7 +49,7 @@ enum Command {
         #[command(flatten)]
         shared: Shared,
     },
-    /// The commit history is the score (single voice; the fugue is Phase 3)
+    /// The commit DAG is the score: branches are voices in a fugue
     History {
         /// Repository path (default: current directory)
         path: Option<PathBuf>,
@@ -61,7 +61,20 @@ enum Command {
         /// No commit cap (large histories compress to one bar per K commits)
         #[arg(long)]
         full: bool,
+        /// Restrict voices to these branches (comma-separated refs)
+        #[arg(long, value_delimiter = ',')]
+        branches: Vec<String>,
+        /// Max simultaneous voices
+        #[arg(long, default_value_t = 6)]
+        voices: u8,
     },
+}
+
+struct HistoryOpts<'a> {
+    range: Option<&'a str>,
+    full: bool,
+    branches: &'a [String],
+    voices: u8,
 }
 
 #[derive(Args)]
@@ -113,15 +126,22 @@ fn run() -> Result<()> {
         // stands: revisit after hearing both).
         None => {
             let repo = cli.path.unwrap_or_else(|| PathBuf::from("."));
-            run_history(&repo, &cli.shared, None, false)
+            let opts = HistoryOpts { range: None, full: false, branches: &[], voices: 6 };
+            run_history(&repo, &cli.shared, &opts)
         }
         Some(Command::Static { path, shared }) => {
             let repo = path.unwrap_or_else(|| PathBuf::from("."));
             run_static(&repo, &shared)
         }
-        Some(Command::History { path, shared, range, full }) => {
+        Some(Command::History { path, shared, range, full, branches, voices }) => {
             let repo = path.unwrap_or_else(|| PathBuf::from("."));
-            run_history(&repo, &shared, range.as_deref(), full)
+            let opts = HistoryOpts {
+                range: range.as_deref(),
+                full,
+                branches: &branches,
+                voices,
+            };
+            run_history(&repo, &shared, &opts)
         }
     }
 }
@@ -131,7 +151,7 @@ fn run() -> Result<()> {
 /// six-hour piece.
 const COMMIT_CAP: usize = 300;
 
-fn run_history(repo: &Path, shared: &Shared, range: Option<&str>, full: bool) -> Result<()> {
+fn run_history(repo: &Path, shared: &Shared, opts: &HistoryOpts) -> Result<()> {
     let scale = parse_scale(shared)?;
 
     // extract
@@ -144,24 +164,44 @@ fn run_history(repo: &Path, shared: &Shared, range: Option<&str>, full: bool) ->
             .context("unexpected commit hash format")?,
     };
     let branch = git.head_branch()?;
-    let total = git.first_parent_count()?;
-    let limit = if full || range.is_some() {
+    let total = git.commit_count()?;
+    let limit = if opts.full || opts.range.is_some() {
         None
     } else {
         Some(COMMIT_CAP)
     };
-    let raw = git.first_parent_log(range, limit)?;
+    let raw = git.log(opts.range, limit, opts.branches, false)?;
     if raw.is_empty() {
         bail!("no commits in the selected range");
     }
 
     // analyze
-    let compress = if raw.len() > 2 * COMMIT_CAP {
-        raw.len().div_ceil(COMMIT_CAP) as u32
+    let model = if raw.len() > 2 * COMMIT_CAP {
+        // Huge history: fold K commits per bar on the first-parent
+        // walk; fugal entries are inaudible at K:1 anyway.
+        let compress = raw.len().div_ceil(COMMIT_CAP) as u32;
+        let fp = git.log(opts.range, None, opts.branches, true)?;
+        analyze::build_folded_model(&fp, identity_seed, branch, total, compress)
     } else {
-        1
+        // Conflict probe per merge (spec §6.2): merge-tree between
+        // parents, degrading to "clean" on any error.
+        let conflicted: Vec<bool> = raw
+            .iter()
+            .map(|c| {
+                c.parents.len() > 1 && git.merge_conflicted(&c.parents[0], &c.parents[1])
+            })
+            .collect();
+        let head = git.head_commit()?;
+        analyze::build_history_model(
+            &raw,
+            identity_seed,
+            branch,
+            total,
+            &head,
+            opts.voices,
+            &conflicted,
+        )
     };
-    let model = analyze::build_history_model(&raw, identity_seed, branch, total, compress);
 
     // compose + render
     let params = ComposeParams {

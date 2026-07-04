@@ -9,22 +9,31 @@ Full design: [gitfugue-spec.md](gitfugue-spec.md).
 
 ## Status
 
-**Phase 2 (history mode, single voice) is implemented.** The commit
-history is the score:
+**Phase 3 (the fugue) is implemented.** The commit DAG is the score:
 
-- First-parent walk of trunk; one commit = one bar (last 300 by
-  default; `--full` folds K commits per bar on big histories)
-- Identity seed from the root commit: key, scale, and tempo are fixed
-  at the repo's birth — new commits extend the song without retconning it
-- A 2–4 bar subject stated in an exposition, then mutated by every
-  commit (operators chosen by commit hash, magnitude by diff size:
-  interval nudge, displacement, ornament, note swap, rare inversion)
+- Full DAG walk in topological order; branch = voice, assigned by a
+  `git log --graph`-style lane allocator; trunk always holds voice 0
+- Exposition: trunk states a 2–4 bar subject from the identity seed
+  (root commit hash — the repo's sound is fixed at birth)
+- Fork: the new voice copies its parent's theme state and enters
+  transposed up a 5th or down a 4th, chosen by branch-name hash
+  (names recovered from merge subjects)
+- Commit = mutation: operators chosen by commit hash (interval nudge,
+  displacement, ornament, note swap, rare inversion), magnitude by
+  diff size — a branch's musical distance tracks its code distance
+- Merge = cadence: both voices sound together for one bar, the target
+  adopts a reconciled (interleaved) theme, the source releases;
+  conflicted merges (detected via `git merge-tree`) get a suspension
+  bar of tension first
+- Voice cap (`--voices`, default 6) with least-recently-active
+  eviction into a shared string-ensemble voice
+- While one voice leads, other active voices comp softly underneath,
+  consonance forced on downbeats
 - Contributors: top authors get lead instruments (stable email-hash
-  mapping), the long tail shares a string ensemble, and bots
-  (dependabot / renovate / `*[bot]`) play the hi-hat
-- Timestamp deltas modulate local tempo ±15%; long gaps insert a
-  capped breath bar; merges get a low cadence strike
-- `--verbose` liner notes name every voice and event
+  mapping) switched onto lanes per commit; bots play the hi-hat
+- Timestamp deltas modulate local tempo ±15%; multi-day gaps insert a
+  capped breath bar; `--verbose` liner notes name every entry, merge,
+  conflict, and eviction
 
 **Phase 1 (static mode) is implemented.** The code at HEAD is the score:
 
@@ -40,8 +49,9 @@ history is the score:
 - Standard MIDI file output with engine version + seed in the metadata
 - Golden byte-identical determinism test in CI-able form
 
-Not yet built: multi-voice fugue with branch lanes and merge cadences
-(Phase 3), WAV/playback and `.gitfugue.toml` (Phase 4).
+Phases 1 (static mode) and 2 remain as described below. Not yet
+built: WAV/playback, embedded soundfont, and `.gitfugue.toml`
+(Phase 4).
 
 ## Usage
 
@@ -62,6 +72,8 @@ Static:
 
 History:
       --range A..B      commit range (default: last 300 commits)
+      --branches LIST   restrict voices to these refs (comma-separated)
+      --voices N        max simultaneous voices (default 6)
       --full            no commit cap (compresses to one bar per K commits)
 ```
 
@@ -69,15 +81,20 @@ Example:
 
 ```
 $ gitfugue history . --verbose
-key: Bb major pentatonic  bpm: 82  (identity from root commit)
-range: 300 first-parent commits on main (of 700 total)
-alice@example.com -> flute (120 commits)
-bob@example.com -> oboe (90 commits)
-dependabot[bot] -> hi-hat (30 commits)
-subject: 3 bars, stated by anchor
-bar 47: merge 3f2c1ab
-bar 112: 62-day gap, breath
-wrote git-fugue.mid (304 bars, Bb major pentatonic, 82 bpm, 5 voices, seed 7e82feef21247d02)
+key: E major pentatonic  bpm: 71  (identity from root commit)
+range: 300 commits, 4 voices used (of 334 total commits)
+voice 0: main (anchor, cello)
+alice@example.com -> electric piano (233 commits)
+bruno@example.com -> nylon guitar (9 commits)
+7 more authors -> string ensemble (16 commits)
+dependabot[bot] -> hi-hat (29 commits)
+subject: 2 bars, stated by main
+bar 3: voice 1 enters (feature/auth, down a 4th)
+bar 27: merge feature/auth -> main, clean, cadence
+bar 61: conflict tension
+bar 62: merge hotfix -> main, conflicted, cadence
+bar 141: 20-day gap, breath
+wrote charlotte.mid (312 bars, E major pentatonic, 71 bpm, 6 voices, seed fb328a59a7272329)
 ```
 
 ## Building

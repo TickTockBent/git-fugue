@@ -15,15 +15,18 @@ pub struct RawFile {
     pub content: Vec<u8>,
 }
 
-/// One commit from the first-parent log, oldest-first.
+/// One commit from the log, oldest-first.
 pub struct RawCommit {
     pub hash: String,
+    pub parents: Vec<String>,
     pub author_name: String,
     pub author_email: String,
     pub timestamp: i64,
     /// insertions + deletions across the commit's diff
     pub diff_magnitude: u32,
     pub is_merge: bool,
+    /// Commit subject; merge subjects carry the branch name.
+    pub subject: String,
 }
 
 pub trait Extractor {
@@ -35,12 +38,25 @@ pub trait Extractor {
     fn head_branch(&self) -> Result<String>;
     /// Root commit reached by first-parent walk (history-mode identity seed).
     fn root_commit_hash(&self) -> Result<String>;
-    /// Total first-parent commit count on HEAD.
-    fn first_parent_count(&self) -> Result<u32>;
-    /// First-parent log, chronological (oldest first). `limit` keeps
-    /// the newest N; `range` is a raw git revision range like "A..B".
-    fn first_parent_log(&self, range: Option<&str>, limit: Option<usize>)
-        -> Result<Vec<RawCommit>>;
+    /// Total commit count reachable from HEAD.
+    fn commit_count(&self) -> Result<u32>;
+    /// Commit log in topological order, reversed to oldest-first, so a
+    /// parent always precedes its children. `limit` keeps the newest N;
+    /// `range` is a raw git revision range; `refs` restricts the walk
+    /// to the given branches; `first_parent` collapses to the trunk walk.
+    fn log(
+        &self,
+        range: Option<&str>,
+        limit: Option<usize>,
+        refs: &[String],
+        first_parent: bool,
+    ) -> Result<Vec<RawCommit>>;
+    /// Hash of the commit HEAD points at.
+    fn head_commit(&self) -> Result<String>;
+    /// Whether merging the two parents would have conflicted
+    /// (spec §6.2, via `git merge-tree`). Errors degrade to "clean":
+    /// older gits without --write-tree must not break rendering.
+    fn merge_conflicted(&self, parent_a: &str, parent_b: &str) -> bool;
 }
 
 /// Day-one implementation: shell out to the git binary.
@@ -158,31 +174,48 @@ impl Extractor for ShellGit {
             .context("could not find a root commit")
     }
 
-    fn first_parent_count(&self) -> Result<u32> {
-        let out = git(&self.repo, &["rev-list", "--count", "--first-parent", "HEAD"])?;
+    fn commit_count(&self) -> Result<u32> {
+        let out = git(&self.repo, &["rev-list", "--count", "HEAD"])?;
         Ok(String::from_utf8(out)?.trim().parse().unwrap_or(0))
     }
 
-    fn first_parent_log(
+    fn head_commit(&self) -> Result<String> {
+        let out = git(&self.repo, &["rev-parse", "HEAD"])?;
+        Ok(String::from_utf8(out)?.trim().to_string())
+    }
+
+    fn log(
         &self,
         range: Option<&str>,
         limit: Option<usize>,
+        refs: &[String],
+        first_parent: bool,
     ) -> Result<Vec<RawCommit>> {
         // Records separated by \x01, header fields by \x1f, then
         // numstat lines until the next record.
         let mut args: Vec<String> = vec![
             "log".into(),
-            "--first-parent".into(),
+            "--topo-order".into(),
             "--numstat".into(),
-            "--format=%x01%H%x1f%P%x1f%an%x1f%ae%x1f%at".into(),
+            "--format=%x01%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s".into(),
         ];
+        if first_parent {
+            args.push("--first-parent".into());
+        }
         if let Some(n) = limit {
             args.push("-n".into());
             args.push(n.to_string());
         }
-        args.push(range.unwrap_or("HEAD").to_string());
+        if let Some(r) = range {
+            args.push(r.to_string());
+        } else if refs.is_empty() {
+            args.push("HEAD".into());
+        }
+        for r in refs {
+            args.push(r.clone());
+        }
         let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = git(&self.repo, &argrefs).context("git log failed (bad --range?)")?;
+        let out = git(&self.repo, &argrefs).context("git log failed (bad --range/--branches?)")?;
         let text = String::from_utf8_lossy(&out);
 
         let mut commits = Vec::new();
@@ -193,7 +226,7 @@ impl Extractor for ShellGit {
                 None => continue,
             };
             let fields: Vec<&str> = header.split('\u{1f}').collect();
-            if fields.len() < 5 {
+            if fields.len() < 6 {
                 continue;
             }
             let mut magnitude: u64 = 0;
@@ -205,17 +238,38 @@ impl Extractor for ShellGit {
                 magnitude += ins.parse::<u64>().unwrap_or(if ins == "-" { 8 } else { 0 });
                 magnitude += del.parse::<u64>().unwrap_or(if del == "-" { 8 } else { 0 });
             }
+            let parents: Vec<String> = fields[1]
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
             commits.push(RawCommit {
                 hash: fields[0].trim().to_string(),
-                is_merge: fields[1].split_whitespace().count() > 1,
+                is_merge: parents.len() > 1,
+                parents,
                 author_name: fields[2].trim().to_string(),
                 author_email: fields[3].trim().to_ascii_lowercase(),
                 timestamp: fields[4].trim().parse().unwrap_or(0),
                 diff_magnitude: magnitude.min(u32::MAX as u64) as u32,
+                subject: fields[5].trim().to_string(),
             });
         }
-        commits.reverse(); // git log is newest-first; the score reads oldest-first
+        // git emits newest-first; reversed topo order puts every parent
+        // before its children, which lane allocation depends on.
+        commits.reverse();
         Ok(commits)
+    }
+
+    fn merge_conflicted(&self, parent_a: &str, parent_b: &str) -> bool {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["merge-tree", "--write-tree", parent_a, parent_b])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // Exit 0 = clean, 1 = conflicts, anything else (or old git
+        // without --write-tree) = assume clean rather than fail.
+        matches!(out, Ok(s) if s.code() == Some(1))
     }
 }
 

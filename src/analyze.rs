@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::extract::{RawCommit, RawFile};
-use crate::model::{Author, CodeUnit, CommitNode, FnUnit, Lang, RepoModel};
+use crate::model::{Author, CodeUnit, CommitNode, FnUnit, Lang, RepoModel, LANE_ENSEMBLE};
 use crate::rng::fnv1a;
 
 const MAX_FILE_BYTES: usize = 1_000_000;
@@ -189,16 +189,7 @@ pub fn is_bot(name: &str, email: &str) -> bool {
         || e.starts_with("renovate")
 }
 
-/// Build RepoModel::History from the raw first-parent log.
-/// `compress` folds every K consecutive commits into one bar (spec §6.1:
-/// at large N, one bar per K commits instead of a six-hour piece).
-pub fn build_history_model(
-    raw: &[RawCommit],
-    identity_seed: u64,
-    branch: String,
-    total_commits: u32,
-    compress: u32,
-) -> RepoModel {
+fn collect_authors(raw: &[RawCommit]) -> (Vec<Author>, Vec<usize>) {
     // Authors keyed by normalized email; empty emails fall back to name.
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     let mut authors: Vec<Author> = Vec::new();
@@ -221,7 +212,197 @@ pub fn build_history_model(
         authors[id].commits += 1;
         author_of.push(id);
     }
+    (authors, author_of)
+}
 
+fn hash_u64(hash: &str) -> u64 {
+    u64::from_str_radix(&hash[..16.min(hash.len())], 16)
+        .unwrap_or_else(|_| fnv1a(hash.as_bytes()))
+}
+
+/// Pull the branch name out of a merge subject, if git or a forge put
+/// one there ("Merge branch 'x'", "Merge pull request #1 from user/x").
+pub fn branch_from_subject(subject: &str) -> Option<String> {
+    if let Some(rest) = subject.strip_prefix("Merge branch '") {
+        return rest.split('\'').next().map(|s| s.to_string());
+    }
+    if let Some(rest) = subject.strip_prefix("Merge remote-tracking branch '") {
+        return rest.split('\'').next().map(|s| s.to_string());
+    }
+    if subject.starts_with("Merge pull request #")
+        && let Some(from) = subject.split(" from ").nth(1) {
+            let name = from.split_whitespace().next().unwrap_or(from);
+            // Strip the owner prefix of "owner/branch".
+            return Some(name.split_once('/').map(|(_, b)| b).unwrap_or(name).to_string());
+        }
+    None
+}
+
+/// Build RepoModel::History from the raw log (full DAG, spec §6.2).
+///
+/// Lane allocation follows the same idea as `git log --graph`: walking
+/// oldest-first, a commit extends the lane whose tip is its first
+/// parent; a commit whose parent was already extended forks a new
+/// lane; a merge closes its second parent's lane. The trunk (HEAD's
+/// first-parent chain) always holds lane 0. At most `max_voices`
+/// lanes; overflow evicts the least-recently-active branch into the
+/// shared ensemble (spec §6.2).
+pub fn build_history_model(
+    raw: &[RawCommit],
+    identity_seed: u64,
+    branch: String,
+    total_commits: u32,
+    head_hash: &str,
+    max_voices: u8,
+    conflicted: &[bool],
+) -> RepoModel {
+    let (authors, author_of) = collect_authors(raw);
+    let cap = max_voices.clamp(2, 12);
+
+    // Hash -> index, for parent resolution inside the window.
+    let by_hash: BTreeMap<&str, usize> =
+        raw.iter().enumerate().map(|(i, c)| (c.hash.as_str(), i)).collect();
+
+    // Trunk: HEAD's first-parent chain within the window.
+    let mut trunk = vec![false; raw.len()];
+    let mut cur = by_hash.get(head_hash).copied();
+    while let Some(i) = cur {
+        trunk[i] = true;
+        cur = raw[i].parents.first().and_then(|p| by_hash.get(p.as_str()).copied());
+    }
+
+    #[derive(Clone, Copy)]
+    struct LaneState {
+        tip: usize,
+        last_active: usize,
+    }
+    let mut lanes: Vec<Option<LaneState>> = vec![None; cap as usize];
+    // Commits that are current tips of ensemble-folded branches.
+    let mut ensemble_tips: std::collections::BTreeSet<usize> = Default::default();
+
+    let mut commits: Vec<CommitNode> = Vec::with_capacity(raw.len());
+    for (i, c) in raw.iter().enumerate() {
+        let parents: Vec<usize> = c
+            .parents
+            .iter()
+            .filter_map(|p| by_hash.get(p.as_str()).copied())
+            .collect();
+        let p1 = parents.first().copied();
+
+        let mut opens_lane = false;
+        let mut evicted_lane = None;
+        let lane: u8 = if trunk[i] {
+            if lanes[0].is_none() {
+                opens_lane = false; // the exposition already stated lane 0
+            }
+            0
+        } else if let Some(p) = p1.filter(|p| ensemble_tips.contains(p)) {
+            ensemble_tips.remove(&p);
+            LANE_ENSEMBLE
+        } else if let Some(l) = p1.and_then(|p| {
+            // Lane 0 is reserved for the trunk chain: a non-trunk child
+            // of the trunk tip is a fork, not a continuation.
+            lanes
+                .iter()
+                .position(|s| matches!(s, Some(st) if st.tip == p))
+                .filter(|l| *l != 0)
+        }) {
+            l as u8 // extends an existing branch lane
+        } else {
+            // Fork: a new voice. Find a free non-trunk lane, or evict
+            // the least-recently-active branch into the ensemble.
+            opens_lane = true;
+            let free = (1..cap as usize).find(|l| lanes[*l].is_none());
+            match free {
+                Some(l) => l as u8,
+                None => {
+                    let l = (1..cap as usize)
+                        .min_by_key(|l| lanes[*l].map(|s| s.last_active).unwrap_or(0))
+                        .unwrap();
+                    if let Some(st) = lanes[l] {
+                        ensemble_tips.insert(st.tip);
+                        evicted_lane = Some(l as u8);
+                    }
+                    l as u8
+                }
+            }
+        };
+
+        // A merge releases its other parents' lanes (spec §6.2).
+        let mut closes_lane = None;
+        for &p in parents.iter().skip(1) {
+            if let Some(l) = lanes
+                .iter()
+                .position(|s| matches!(s, Some(st) if st.tip == p))
+                && l as u8 != lane {
+                    closes_lane = Some(l as u8);
+                    lanes[l] = None;
+                }
+            ensemble_tips.remove(&p);
+        }
+
+        if lane != LANE_ENSEMBLE {
+            lanes[lane as usize] = Some(LaneState { tip: i, last_active: i });
+        } else {
+            ensemble_tips.insert(i);
+        }
+
+        commits.push(CommitNode {
+            hash: hash_u64(&c.hash),
+            short: c.hash.chars().take(7).collect(),
+            parents,
+            author_id: author_of[i],
+            timestamp: c.timestamp,
+            diff_magnitude: c.diff_magnitude,
+            is_merge: c.is_merge,
+            folded: 1,
+            lane,
+            opens_lane,
+            closes_lane,
+            fork_name: None,
+            conflicted: conflicted.get(i).copied().unwrap_or(false),
+            evicted_lane,
+        });
+    }
+
+    // Second pass: recover branch names. Walk each merge's second
+    // parent back along first parents to the fork commit and label it.
+    for i in 0..commits.len() {
+        if !commits[i].is_merge || commits[i].closes_lane.is_none() {
+            continue;
+        }
+        let name = branch_from_subject(&raw[i].subject);
+        let mut cur = commits[i].parents.get(1).copied();
+        while let Some(j) = cur {
+            if commits[j].opens_lane {
+                if commits[j].fork_name.is_none() {
+                    commits[j].fork_name = name.clone();
+                }
+                break;
+            }
+            cur = commits[j].parents.first().copied();
+        }
+    }
+
+    RepoModel::History {
+        identity_seed,
+        branch,
+        commits,
+        authors,
+        total_commits,
+    }
+}
+
+/// Compressed fallback for huge histories: first-parent walk folded K
+/// commits per bar, single voice (entries are inaudible at K:1 anyway).
+pub fn build_folded_model(
+    raw: &[RawCommit],
+    identity_seed: u64,
+    branch: String,
+    total_commits: u32,
+    compress: u32,
+) -> RepoModel {
+    let (authors, author_of) = collect_authors(raw);
     let k = compress.max(1) as usize;
     let mut commits = Vec::with_capacity(raw.len().div_ceil(k));
     for group in raw.chunks(k) {
@@ -242,9 +423,9 @@ pub fn build_history_model(
             }
         }
         commits.push(CommitNode {
-            hash: u64::from_str_radix(&last.hash[..16.min(last.hash.len())], 16)
-                .unwrap_or_else(|_| fnv1a(last.hash.as_bytes())),
+            hash: hash_u64(&last.hash),
             short: last.hash.chars().take(7).collect(),
+            parents: Vec::new(),
             author_id: best,
             timestamp: last.timestamp,
             diff_magnitude: group
@@ -254,6 +435,12 @@ pub fn build_history_model(
                 .min(u32::MAX as u64) as u32,
             is_merge: group.iter().any(|c| c.is_merge),
             folded: group.len() as u32,
+            lane: 0,
+            opens_lane: false,
+            closes_lane: None,
+            fork_name: None,
+            conflicted: false,
+            evicted_lane: None,
         });
     }
 
@@ -312,6 +499,102 @@ fn tree_sitter_functions(path: &Path, text: &str, lines: &[&str]) -> Option<Vec<
     }
     // The stack walk (children pushed in reverse) yields document order.
     Some(fns)
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    fn rc(hash: &str, parents: &[&str], subject: &str) -> RawCommit {
+        RawCommit {
+            hash: hash.repeat(40 / hash.len().max(1)),
+            parents: parents
+                .iter()
+                .map(|p| p.repeat(40 / p.len().max(1)))
+                .collect(),
+            author_name: "A".into(),
+            author_email: "a@x".into(),
+            timestamp: 0,
+            diff_magnitude: 10,
+            is_merge: parents.len() > 1,
+            subject: subject.into(),
+        }
+    }
+
+    fn lanes_of(model: &RepoModel) -> Vec<u8> {
+        match model {
+            RepoModel::History { commits, .. } => commits.iter().map(|c| c.lane).collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn linear_chain_is_all_trunk() {
+        let raw = vec![rc("a1", &[], "init"), rc("b2", &["a1"], "x"), rc("c3", &["b2"], "y")];
+        let head = raw[2].hash.clone();
+        let m = build_history_model(&raw, 1, "main".into(), 3, &head, 6, &[]);
+        assert_eq!(lanes_of(&m), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn fork_and_merge_open_and_close_a_lane() {
+        // a1 - b2 ------- e5(merge) - f6
+        //        \ c3 - d4 /
+        let raw = vec![
+            rc("a1", &[], "init"),
+            rc("b2", &["a1"], "x"),
+            rc("c3", &["b2"], "feature work"),
+            rc("d4", &["c3"], "more"),
+            rc("e5", &["b2", "d4"], "Merge branch 'feature/z'"),
+            rc("f6", &["e5"], "after"),
+        ];
+        let head = raw[5].hash.clone();
+        let m = build_history_model(&raw, 1, "main".into(), 6, &head, 6, &[]);
+        match &m {
+            RepoModel::History { commits, .. } => {
+                assert_eq!(lanes_of(&m), vec![0, 0, 1, 1, 0, 0]);
+                assert!(commits[2].opens_lane, "c3 forks lane 1");
+                assert_eq!(commits[4].closes_lane, Some(1), "merge closes lane 1");
+                assert_eq!(
+                    commits[2].fork_name.as_deref(),
+                    Some("feature/z"),
+                    "fork gets its name from the merge subject"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn overflow_evicts_least_recently_active() {
+        // Trunk plus 3 concurrent branches with a 3-voice cap: the
+        // third branch must evict the least recently active.
+        let mut raw = vec![rc("a1", &[], "init")];
+        raw.push(rc("b1", &["a1"], "br1")); // lane 1
+        raw.push(rc("c1", &["a1"], "br2")); // lane 2
+        raw.push(rc("d1", &["a1"], "br3")); // overflow: evict lane 1 (b1 oldest)
+        let head = raw[0].hash.clone(); // trunk = just a1
+        let m = build_history_model(&raw, 1, "main".into(), 4, &head, 3, &[]);
+        match &m {
+            RepoModel::History { commits, .. } => {
+                assert_eq!(commits[1].lane, 1);
+                assert_eq!(commits[2].lane, 2);
+                assert_eq!(commits[3].lane, 1, "reuses the evicted lane");
+                assert_eq!(commits[3].evicted_lane, Some(1));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn branch_names_from_subjects() {
+        assert_eq!(branch_from_subject("Merge branch 'fix/bug'").as_deref(), Some("fix/bug"));
+        assert_eq!(
+            branch_from_subject("Merge pull request #7 from alice/feat-x").as_deref(),
+            Some("feat-x")
+        );
+        assert_eq!(branch_from_subject("regular commit"), None);
+    }
 }
 
 #[cfg(test)]

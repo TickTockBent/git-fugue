@@ -178,6 +178,78 @@ impl Theme {
             n.degree = 2 * self.center - n.degree;
         }
     }
+
+    /// Shift the whole theme by scale steps: the fugal answer enters
+    /// at the 4th or 5th (spec §6.2).
+    pub fn transpose(&mut self, steps: i32) {
+        self.center += steps;
+        self.lo += steps;
+        self.hi += steps;
+        for n in &mut self.notes {
+            n.degree += steps;
+        }
+    }
+
+    /// Merge cadence reconciliation (spec §6.2): the target voice
+    /// adopts a theme interleaved from both parents, seeded by the
+    /// merge commit hash. Register (center/range) stays the target's.
+    pub fn reconcile(target: &Theme, source: &Theme, rng: &mut Rng) -> Theme {
+        let mut out = target.clone();
+        let shift = target.center - source.center; // undo entry transposition
+        out.notes.clear();
+        for bar in 0..out.bars {
+            let a = target.bar(bar);
+            let b = source.bar(bar % source.bars.max(1));
+            let mut taken: Vec<(u32, i32, u8)> = Vec::new();
+            let mut slots_seen: std::collections::BTreeSet<u32> = Default::default();
+            // Walk both parents' notes in slot order, choosing sides.
+            let mut ai = 0;
+            let mut bi = 0;
+            while ai < a.len() || bi < b.len() {
+                let pick_a = match (a.get(ai), b.get(bi)) {
+                    (Some(x), Some(y)) => {
+                        if x.0 == y.0 {
+                            // Same slot in both: coin flip decides.
+                            rng.weighted(&[50, 50]) == 0
+                        } else {
+                            x.0 < y.0
+                        }
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let (slot, degree, weight) = if pick_a {
+                    let n = a[ai];
+                    ai += 1;
+                    // The other side's same-slot note (if any) is dropped.
+                    if b.get(bi).is_some_and(|y| y.0 == n.0) {
+                        bi += 1;
+                    }
+                    n
+                } else {
+                    let n = b[bi];
+                    bi += 1;
+                    if a.get(ai).is_some_and(|x| x.0 == n.0) {
+                        ai += 1;
+                    }
+                    (n.0, n.1 + shift, n.2)
+                };
+                if taken.len() < 7 && slots_seen.insert(slot) {
+                    taken.push((slot, degree, weight));
+                }
+            }
+            for (slot, degree, weight) in taken {
+                out.notes.push(ThemeNote {
+                    slot: bar * 16 + slot,
+                    degree: degree.clamp(out.lo, out.hi),
+                    weight,
+                });
+            }
+        }
+        out.notes.sort_by_key(|n| n.slot);
+        out
+    }
 }
 
 pub fn slot_weight(slot_in_bar: u32) -> u8 {

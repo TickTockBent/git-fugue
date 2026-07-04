@@ -177,6 +177,7 @@ fn compose_static(seed: u64, units: &[CodeUnit], params: &ComposeParams) -> Scor
         voices,
         events: notes,
         tempo_map: vec![(0, bpm)],
+        program_changes: Vec::new(),
         liner_notes: liner,
         seed,
     }
