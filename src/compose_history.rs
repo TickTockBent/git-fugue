@@ -115,15 +115,21 @@ pub fn compose_history(
         tick += BAR;
     }
 
+    // A breath needs a real hiatus: well beyond the repo's own rhythm
+    // AND multiple days of wall clock. Burst-committed repos have a
+    // tiny median delta; without the floor every coffee break breathes.
+    const BREATH_FLOOR: i64 = 3 * 86_400;
+
     // One commit = one bar.
     for (i, commit) in commits.iter().enumerate() {
         // Breath rest on long gaps, capped at a single bar (spec §6.1:
         // never literal silence proportional to wall-clock time).
-        if i > 0 && median > 0 && deltas[i - 1] > 8 * median {
+        if i > 0 && median > 0 && deltas[i - 1] > (8 * median).max(BREATH_FLOOR) {
+            let gap = deltas[i - 1];
             liner.push(format!(
                 "bar {}: {}-day gap, breath",
                 bar_no(tick),
-                deltas[i - 1] / 86_400
+                gap / 86_400
             ));
             notes.push(NoteEvent {
                 voice: 0,
