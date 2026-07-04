@@ -4,10 +4,12 @@
 
 mod analyze;
 mod compose;
+mod compose_history;
 mod extract;
 mod model;
 mod render;
 mod rng;
+mod theme;
 mod theory;
 
 use std::path::{Path, PathBuf};
@@ -47,12 +49,18 @@ enum Command {
         #[command(flatten)]
         shared: Shared,
     },
-    /// The commit DAG is the score (Phase 2, not yet implemented)
+    /// The commit history is the score (single voice; the fugue is Phase 3)
     History {
         /// Repository path (default: current directory)
         path: Option<PathBuf>,
         #[command(flatten)]
         shared: Shared,
+        /// Commit range (e.g. v1.0..HEAD); default: last 300 commits
+        #[arg(long)]
+        range: Option<String>,
+        /// No commit cap (large histories compress to one bar per K commits)
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -100,32 +108,82 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let (mode, path, shared) = match cli.command {
-        // Bare `gitfugue` defaults to static for now: it is the mode
-        // that exists. Spec open question 6 revisits this in Phase 2.
-        None => ("static", cli.path, cli.shared),
-        Some(Command::Static { path, shared }) => ("static", path, shared),
-        Some(Command::History { .. }) => {
-            bail!(
-                "history mode is Phase 2 and not implemented yet; \
-                 try `gitfugue static` for now"
-            );
+    match cli.command {
+        // Bare `gitfugue` is history mode, per spec §7 (open question 6
+        // stands: revisit after hearing both).
+        None => {
+            let repo = cli.path.unwrap_or_else(|| PathBuf::from("."));
+            run_history(&repo, &cli.shared, None, false)
         }
+        Some(Command::Static { path, shared }) => {
+            let repo = path.unwrap_or_else(|| PathBuf::from("."));
+            run_static(&repo, &shared)
+        }
+        Some(Command::History { path, shared, range, full }) => {
+            let repo = path.unwrap_or_else(|| PathBuf::from("."));
+            run_history(&repo, &shared, range.as_deref(), full)
+        }
+    }
+}
+
+/// Default range: the last 300 commits (spec §6.1). Anything larger
+/// folds K commits per bar so `--full` on a 10k-commit repo is not a
+/// six-hour piece.
+const COMMIT_CAP: usize = 300;
+
+fn run_history(repo: &Path, shared: &Shared, range: Option<&str>, full: bool) -> Result<()> {
+    let scale = parse_scale(shared)?;
+
+    // extract
+    let git = ShellGit::open(repo)?;
+    let root_hash = git.root_commit_hash()?;
+    let identity_seed = match &shared.seed {
+        Some(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+            .context("--seed must be hex")?,
+        None => u64::from_str_radix(&root_hash[..16.min(root_hash.len())], 16)
+            .context("unexpected commit hash format")?,
     };
-    let repo = path.unwrap_or_else(|| PathBuf::from("."));
-    match mode {
-        "static" => run_static(&repo, &shared),
-        _ => unreachable!(),
+    let branch = git.head_branch()?;
+    let total = git.first_parent_count()?;
+    let limit = if full || range.is_some() {
+        None
+    } else {
+        Some(COMMIT_CAP)
+    };
+    let raw = git.first_parent_log(range, limit)?;
+    if raw.is_empty() {
+        bail!("no commits in the selected range");
+    }
+
+    // analyze
+    let compress = if raw.len() > 2 * COMMIT_CAP {
+        raw.len().div_ceil(COMMIT_CAP) as u32
+    } else {
+        1
+    };
+    let model = analyze::build_history_model(&raw, identity_seed, branch, total, compress);
+
+    // compose + render
+    let params = ComposeParams {
+        scale,
+        bpm: shared.bpm,
+        duration_secs: shared.duration,
+    };
+    let score = compose::compose(&model, &params);
+    write_output(repo, shared, &score)
+}
+
+fn parse_scale(shared: &Shared) -> Result<Option<Scale>> {
+    match &shared.scale {
+        Some(s) => Ok(Some(Scale::parse(s).with_context(|| {
+            format!("unknown scale '{s}' (pentatonic | minor-pentatonic | dorian | aeolian)")
+        })?)),
+        None => Ok(None),
     }
 }
 
 fn run_static(repo: &Path, shared: &Shared) -> Result<()> {
-    let scale = match &shared.scale {
-        Some(s) => Some(Scale::parse(s).with_context(|| {
-            format!("unknown scale '{s}' (pentatonic | minor-pentatonic | dorian | aeolian)")
-        })?),
-        None => None,
-    };
+    let scale = parse_scale(shared)?;
 
     // extract
     let git = ShellGit::open(repo)?;
@@ -152,11 +210,13 @@ fn run_static(repo: &Path, shared: &Shared) -> Result<()> {
         duration_secs: shared.duration,
     };
     let score = compose::compose(&model, &params);
+    write_output(repo, shared, &score)
+}
 
-    // render
+fn write_output(repo: &Path, shared: &Shared, score: &model::Score) -> Result<()> {
     let out = output_path(repo, shared)?;
     let bytes = match out.extension().and_then(|e| e.to_str()) {
-        Some("mid") | Some("midi") => render::render_midi(&score)?,
+        Some("mid") | Some("midi") => render::render_midi(score)?,
         Some("wav") => bail!("WAV rendering is Phase 4 and not implemented yet; use .mid"),
         _ => bail!("unsupported output extension (use .mid)"),
     };

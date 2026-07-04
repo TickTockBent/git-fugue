@@ -6,10 +6,11 @@
 //! Nesting depth is always the indentation proxy — cheap and
 //! language-agnostic (spec §5.1, open question 5).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::extract::RawFile;
-use crate::model::{CodeUnit, FnUnit, Lang};
+use crate::extract::{RawCommit, RawFile};
+use crate::model::{Author, CodeUnit, CommitNode, FnUnit, Lang, RepoModel};
 use crate::rng::fnv1a;
 
 const MAX_FILE_BYTES: usize = 1_000_000;
@@ -171,6 +172,97 @@ fn block_to_fn(lines: &[&str], start: usize, end: usize, unit: usize) -> FnUnit 
         name_hash: fnv1a(lines[start].trim().as_bytes()),
         lines: loc.max(1),
         nesting: nesting.min(255) as u8,
+    }
+}
+
+// ---- history mode ----
+
+/// Bot detection (spec §6.3): dependabot, renovate, `*[bot]`.
+pub fn is_bot(name: &str, email: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let e = email.to_ascii_lowercase();
+    n.contains("[bot]")
+        || e.contains("[bot]")
+        || n.starts_with("dependabot")
+        || n.starts_with("renovate")
+        || e.starts_with("dependabot")
+        || e.starts_with("renovate")
+}
+
+/// Build RepoModel::History from the raw first-parent log.
+/// `compress` folds every K consecutive commits into one bar (spec §6.1:
+/// at large N, one bar per K commits instead of a six-hour piece).
+pub fn build_history_model(
+    raw: &[RawCommit],
+    identity_seed: u64,
+    branch: String,
+    total_commits: u32,
+    compress: u32,
+) -> RepoModel {
+    // Authors keyed by normalized email; empty emails fall back to name.
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    let mut authors: Vec<Author> = Vec::new();
+    let mut author_of = Vec::with_capacity(raw.len());
+    for c in raw {
+        let key = if c.author_email.is_empty() {
+            c.author_name.to_ascii_lowercase()
+        } else {
+            c.author_email.clone()
+        };
+        let id = *index.entry(key.clone()).or_insert_with(|| {
+            authors.push(Author {
+                email: key,
+                name: c.author_name.clone(),
+                commits: 0,
+                is_bot: is_bot(&c.author_name, &c.author_email),
+            });
+            authors.len() - 1
+        });
+        authors[id].commits += 1;
+        author_of.push(id);
+    }
+
+    let k = compress.max(1) as usize;
+    let mut commits = Vec::with_capacity(raw.len().div_ceil(k));
+    for group in raw.chunks(k) {
+        let gi = commits.len() * k;
+        let last = group.last().unwrap();
+        // Majority author of the group; ties go to the earliest seen.
+        let mut counts: BTreeMap<usize, u32> = BTreeMap::new();
+        for (j, _) in group.iter().enumerate() {
+            *counts.entry(author_of[gi + j]).or_insert(0) += 1;
+        }
+        let mut best = author_of[gi];
+        let mut best_count = 0;
+        for (j, _) in group.iter().enumerate() {
+            let id = author_of[gi + j];
+            if counts[&id] > best_count {
+                best = id;
+                best_count = counts[&id];
+            }
+        }
+        commits.push(CommitNode {
+            hash: u64::from_str_radix(&last.hash[..16.min(last.hash.len())], 16)
+                .unwrap_or_else(|_| fnv1a(last.hash.as_bytes())),
+            short: last.hash.chars().take(7).collect(),
+            author_id: best,
+            timestamp: last.timestamp,
+            diff_magnitude: group
+                .iter()
+                .map(|c| c.diff_magnitude as u64)
+                .sum::<u64>()
+                .min(u32::MAX as u64) as u32,
+            is_merge: group.iter().any(|c| c.is_merge),
+            folded: group.len() as u32,
+        });
+    }
+
+    RepoModel::History {
+        identity_seed,
+        branch,
+        commits,
+        authors,
+        total_commits,
     }
 }
 

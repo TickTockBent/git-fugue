@@ -130,6 +130,32 @@ impl MelodyWalk {
 
 }
 
+/// Choose `density` slots on the 16th grid. Beat 1 always sounds;
+/// remaining slots are weighted toward metrically strong positions.
+pub fn pick_positions(rng: &mut Rng, density: u32, last_bar: bool) -> Vec<u32> {
+    let mut chosen = vec![0u32];
+    let limit = if last_bar { 14 } else { 16 }; // leave a breath at phrase end
+    let mut candidates: Vec<u32> = (1..limit).collect();
+    while (chosen.len() as u32) < density && !candidates.is_empty() {
+        let weights: Vec<u32> = candidates
+            .iter()
+            .map(|s| {
+                if s % 4 == 0 {
+                    8
+                } else if s % 2 == 0 {
+                    5
+                } else {
+                    2
+                }
+            })
+            .collect();
+        let i = rng.weighted(&weights);
+        chosen.push(candidates.remove(i));
+    }
+    chosen.sort_unstable();
+    chosen
+}
+
 /// Convert an absolute scale-step index to a MIDI pitch.
 pub fn steps_to_midi(key: Key, scale: Scale, steps: i32) -> u8 {
     let degs = scale.degrees();

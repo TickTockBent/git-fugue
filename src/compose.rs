@@ -11,11 +11,11 @@ use crate::model::{
     CodeUnit, Key, Lang, NoteEvent, RepoModel, Scale, Score, Tick, Voice,
 };
 use crate::rng::Rng;
-use crate::theory::{MelodyWalk, CONTOURS};
+use crate::theory::{pick_positions, MelodyWalk, CONTOURS};
 
 pub const TPQ: u32 = 480; // ticks per quarter note
-const SLOT: u32 = TPQ / 4; // 16th-note grid
-const BAR: u32 = TPQ * 4; // 4/4
+pub(crate) const SLOT: u32 = TPQ / 4; // 16th-note grid
+pub(crate) const BAR: u32 = TPQ * 4; // 4/4
 
 pub struct ComposeParams {
     pub scale: Option<Scale>,
@@ -39,6 +39,20 @@ struct Section {
 pub fn compose(model: &RepoModel, params: &ComposeParams) -> Score {
     match model {
         RepoModel::Static { seed, units } => compose_static(*seed, units, params),
+        RepoModel::History {
+            identity_seed,
+            branch,
+            commits,
+            authors,
+            total_commits,
+        } => crate::compose_history::compose_history(
+            *identity_seed,
+            branch,
+            commits,
+            authors,
+            *total_commits,
+            params,
+        ),
     }
 }
 
@@ -394,32 +408,6 @@ fn gen_phrase(
     }
 }
 
-/// Choose `density` slots on the 16th grid. Beat 1 always sounds;
-/// remaining slots are weighted toward metrically strong positions.
-fn pick_positions(rng: &mut Rng, density: u32, last_bar: bool) -> Vec<u32> {
-    let mut chosen = vec![0u32];
-    let limit = if last_bar { 14 } else { 16 }; // leave a breath at phrase end
-    let mut candidates: Vec<u32> = (1..limit).collect();
-    while (chosen.len() as u32) < density && !candidates.is_empty() {
-        let weights: Vec<u32> = candidates
-            .iter()
-            .map(|s| {
-                if s % 4 == 0 {
-                    8
-                } else if s % 2 == 0 {
-                    5
-                } else {
-                    2
-                }
-            })
-            .collect();
-        let i = rng.weighted(&weights);
-        chosen.push(candidates.remove(i));
-    }
-    chosen.sort_unstable();
-    chosen
-}
-
 /// Sustained root + fifth under everything; a fifth->root walk in
 /// transition bars so section changes are audible as cadences.
 fn gen_drone(
@@ -579,6 +567,7 @@ mod tests {
             RepoModel::Static { units, .. } => {
                 compose(&RepoModel::Static { seed: 0xCAFED00D, units }, &p)
             }
+            _ => unreachable!(),
         };
         let sig_a: Vec<u8> = a.events.iter().take(40).map(|e| e.pitch).collect();
         let sig_b: Vec<u8> = b.events.iter().take(40).map(|e| e.pitch).collect();

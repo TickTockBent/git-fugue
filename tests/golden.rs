@@ -10,13 +10,23 @@ use std::path::Path;
 use std::process::Command;
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden.mid");
+const GOLDEN_HISTORY: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden_history.mid");
 
 fn sh(dir: &Path, cmd: &str, args: &[&str]) {
-    let out = Command::new(cmd)
-        .current_dir(dir)
+    sh_env(dir, cmd, args, &[]);
+}
+
+fn sh_env(dir: &Path, cmd: &str, args: &[&str], env: &[(&str, &str)]) {
+    let mut c = Command::new(cmd);
+    c.current_dir(dir)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c
         .output()
         .unwrap_or_else(|e| panic!("failed to run {cmd}: {e}"));
     assert!(
@@ -98,6 +108,127 @@ fn golden_midi_is_byte_identical() {
         "output no longer matches golden fixture; if the engine changed \
          intentionally, bump the version and regenerate with UPDATE_GOLDEN=1"
     );
+}
+
+/// History fixture: every commit pins author, email, and both dates,
+/// so commit hashes -- and therefore the rendered bytes -- are stable.
+/// Two humans, one bot, a merge, and a 60-day gap (breath bar).
+fn build_history_fixture(dir: &Path) {
+    sh(dir, "git", &["init", "-q", "-b", "main"]);
+    sh(dir, "git", &["config", "user.email", "fixture@gitfugue.test"]);
+    sh(dir, "git", &["config", "user.name", "Fixture"]);
+
+    let day = 86_400i64;
+    let t0 = 1_600_000_000i64;
+    let mut commit = |file: &str, content: &str, msg: &str, author: (&str, &str), ts: i64| {
+        std::fs::write(dir.join(file), content).unwrap();
+        sh(dir, "git", &["add", "-A"]);
+        let date = format!("{ts} +0000");
+        sh_env(
+            dir,
+            "git",
+            &["commit", "-q", "-m", msg],
+            &[
+                ("GIT_AUTHOR_NAME", author.0),
+                ("GIT_AUTHOR_EMAIL", author.1),
+                ("GIT_AUTHOR_DATE", &date),
+                ("GIT_COMMITTER_NAME", "Fixture"),
+                ("GIT_COMMITTER_EMAIL", "fixture@gitfugue.test"),
+                ("GIT_COMMITTER_DATE", &date),
+            ],
+        );
+    };
+
+    let alice = ("Alice", "alice@example.com");
+    let bob = ("Bob", "bob@example.com");
+    let bot = ("dependabot[bot]", "49699333+dependabot[bot]@users.noreply.github.com");
+
+    commit("main.py", "def main():\n    pass\n", "init", alice, t0);
+    commit("main.py", "def main():\n    run()\n\ndef run():\n    pass\n", "add run", alice, t0 + day);
+    commit("util.py", "def helper(x):\n    return x * 2\n", "helpers", bob, t0 + 2 * day);
+    commit("deps.txt", "requests==2.28.0\n", "bump requests", bot, t0 + 3 * day);
+    commit("main.py", "def main():\n    run()\n    log()\n\ndef run():\n    pass\n\ndef log():\n    print('hi')\n", "logging", alice, t0 + 4 * day);
+    // Side branch merged back: the first-parent walk sees a merge commit.
+    sh(dir, "git", &["checkout", "-q", "-b", "feature", "HEAD~1"]);
+    commit("feature.py", "def feat():\n    return 1\n", "feature work", bob, t0 + 5 * day);
+    sh(dir, "git", &["checkout", "-q", "main"]);
+    let mdate = format!("{} +0000", t0 + 6 * day);
+    sh_env(
+        dir,
+        "git",
+        &["merge", "-q", "--no-ff", "-m", "merge feature", "feature"],
+        &[
+            ("GIT_AUTHOR_NAME", "Alice"),
+            ("GIT_AUTHOR_EMAIL", "alice@example.com"),
+            ("GIT_AUTHOR_DATE", &mdate),
+            ("GIT_COMMITTER_NAME", "Fixture"),
+            ("GIT_COMMITTER_EMAIL", "fixture@gitfugue.test"),
+            ("GIT_COMMITTER_DATE", &mdate),
+        ],
+    );
+    // A long quiet stretch, then one more change: exercises the breath.
+    commit("util.py", "def helper(x):\n    return x * 3\n", "tune helper", bob, t0 + 66 * day);
+}
+
+fn render_history(repo: &Path, out: &Path) -> Vec<u8> {
+    let exe = env!("CARGO_BIN_EXE_gitfugue");
+    let status = Command::new(exe)
+        .args(["history"])
+        .arg(repo)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .expect("failed to run gitfugue");
+    assert!(status.success(), "gitfugue history exited nonzero");
+    std::fs::read(out).expect("output file missing")
+}
+
+#[test]
+fn golden_history_midi_is_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("histfix");
+    std::fs::create_dir(&repo).unwrap();
+    build_history_fixture(&repo);
+
+    let a = render_history(&repo, &tmp.path().join("a.mid"));
+    let b = render_history(&repo, &tmp.path().join("b.mid"));
+    assert_eq!(a, b, "two renders of the same history differ");
+
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::write(GOLDEN_HISTORY, &a).unwrap();
+        eprintln!("golden file updated: {GOLDEN_HISTORY}");
+        return;
+    }
+    let golden = std::fs::read(GOLDEN_HISTORY)
+        .expect("tests/fixtures/golden_history.mid missing; run with UPDATE_GOLDEN=1");
+    assert_eq!(
+        a, golden,
+        "history output no longer matches golden fixture; if the engine \
+         changed intentionally, bump the version and regenerate with UPDATE_GOLDEN=1"
+    );
+}
+
+#[test]
+fn history_liner_notes_name_the_players() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("histfix");
+    std::fs::create_dir(&repo).unwrap();
+    build_history_fixture(&repo);
+
+    let exe = env!("CARGO_BIN_EXE_gitfugue");
+    let out = Command::new(exe)
+        .args(["history"])
+        .arg(&repo)
+        .args(["--verbose", "-o"])
+        .arg(tmp.path().join("v.mid"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("alice@example.com ->"), "missing alice voice line:\n{text}");
+    assert!(text.contains("dependabot[bot] -> hi-hat"), "missing bot percussion line:\n{text}");
+    assert!(text.contains("merge"), "missing merge event line:\n{text}");
+    assert!(text.contains("breath"), "missing breath (gap) line:\n{text}");
 }
 
 #[test]

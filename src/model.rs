@@ -102,10 +102,43 @@ pub struct CodeUnit {
     pub functions: Vec<FnUnit>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Author {
+    pub email: String,
+    pub name: String,
+    pub commits: u32,
+    pub is_bot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitNode {
+    /// First 64 bits of the commit oid: the per-commit mutation seed
+    /// (spec §4.1).
+    pub hash: u64,
+    pub short: String,
+    pub author_id: usize,
+    pub timestamp: i64,
+    pub diff_magnitude: u32,
+    pub is_merge: bool,
+    /// How many raw commits this bar represents (>1 under compression).
+    pub folded: u32,
+}
+
 /// Mode-specific input to the composer.
 pub enum RepoModel {
-    Static { seed: u64, units: Vec<CodeUnit> },
-    // History { ... }  -- Phase 2
+    Static {
+        seed: u64,
+        units: Vec<CodeUnit>,
+    },
+    History {
+        /// From the root commit hash: the repo's identity is fixed at
+        /// birth; new commits extend the song without retconning it.
+        identity_seed: u64,
+        branch: String,
+        commits: Vec<CommitNode>,
+        authors: Vec<Author>,
+        total_commits: u32,
+    },
 }
 
 // ---- Composer output ----

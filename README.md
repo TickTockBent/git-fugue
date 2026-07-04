@@ -9,6 +9,23 @@ Full design: [gitfugue-spec.md](gitfugue-spec.md).
 
 ## Status
 
+**Phase 2 (history mode, single voice) is implemented.** The commit
+history is the score:
+
+- First-parent walk of trunk; one commit = one bar (last 300 by
+  default; `--full` folds K commits per bar on big histories)
+- Identity seed from the root commit: key, scale, and tempo are fixed
+  at the repo's birth — new commits extend the song without retconning it
+- A 2–4 bar subject stated in an exposition, then mutated by every
+  commit (operators chosen by commit hash, magnitude by diff size:
+  interval nudge, displacement, ornament, note swap, rare inversion)
+- Contributors: top authors get lead instruments (stable email-hash
+  mapping), the long tail shares a string ensemble, and bots
+  (dependabot / renovate / `*[bot]`) play the hi-hat
+- Timestamp deltas modulate local tempo ±15%; long gaps insert a
+  capped breath bar; merges get a low cadence strike
+- `--verbose` liner notes name every voice and event
+
 **Phase 1 (static mode) is implemented.** The code at HEAD is the score:
 
 - Sorted walk of tracked files at HEAD (read from the HEAD tree, so a
@@ -23,33 +40,44 @@ Full design: [gitfugue-spec.md](gitfugue-spec.md).
 - Standard MIDI file output with engine version + seed in the metadata
 - Golden byte-identical determinism test in CI-able form
 
-Not yet built: history mode (Phase 2), the fugue (Phase 3), WAV/playback
-and `.gitfugue.toml` (Phase 4).
+Not yet built: multi-voice fugue with branch lanes and merge cadences
+(Phase 3), WAV/playback and `.gitfugue.toml` (Phase 4).
 
 ## Usage
 
 ```
-gitfugue [PATH]              # static mode on the repo (history mode is Phase 2)
-gitfugue static [PATH]
+gitfugue [PATH]              # history mode (spec default)
+gitfugue static [PATH]       # the code at HEAD is the score
+gitfugue history [PATH]      # the commit history is the score
 
+Shared flags:
   -o, --out FILE        output path (default: <repo-name>.mid)
       --seed HEX        override the seed (exploration/debugging)
       --scale NAME      pentatonic | minor-pentatonic | dorian | aeolian
       --bpm N           override base tempo
-      --duration SECS   target length (default 90-180, chosen by seed)
   -v, --verbose         print liner notes (the deterministic decision log)
+
+Static:
+      --duration SECS   target length (default 90-180, chosen by seed)
+
+History:
+      --range A..B      commit range (default: last 300 commits)
+      --full            no commit cap (compresses to one bar per K commits)
 ```
 
 Example:
 
 ```
-$ gitfugue static . --verbose
-key: D major pentatonic  bpm: 96  target: 99s (39 bars)
-section src: 24 bars (1420 loc, 7 files)
-section tests: 8 bars (310 loc, 2 files)
-voice 0: cello
-voice 1: pizzicato strings
-wrote git-fugue.mid (39 bars, D major pentatonic, 96 bpm, 3 voices, seed 75455d634a453651)
+$ gitfugue history . --verbose
+key: Bb major pentatonic  bpm: 82  (identity from root commit)
+range: 300 first-parent commits on main (of 700 total)
+alice@example.com -> flute (120 commits)
+bob@example.com -> oboe (90 commits)
+dependabot[bot] -> hi-hat (30 commits)
+subject: 3 bars, stated by anchor
+bar 47: merge 3f2c1ab
+bar 112: 62-day gap, breath
+wrote git-fugue.mid (304 bars, Bb major pentatonic, 82 bpm, 5 voices, seed 7e82feef21247d02)
 ```
 
 ## Building
@@ -77,9 +105,12 @@ src/extract.rs  src/analyze.rs  src/compose.rs  src/render.rs
                                  decisions)
 ```
 
-- `src/model.rs` — the IRs: `RepoModel`, `CodeUnit`, `Score`
+- `src/model.rs` — the IRs: `RepoModel`, `CodeUnit`, `CommitNode`, `Score`
 - `src/theory.rs` — the constraint layer: scales, contour templates,
   voice-leading walk. Data selects; theory constrains.
+- `src/theme.rs` — the subject and its mutation operators (history mode)
+- `src/compose_history.rs` — history-mode composer: exposition,
+  commit bars, author timbres, tempo modulation
 - `src/rng.rs` — SplitMix64, seeded hierarchically per scope. No
   hash-map iteration order ever feeds a musical choice.
 

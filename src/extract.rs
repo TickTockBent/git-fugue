@@ -15,11 +15,32 @@ pub struct RawFile {
     pub content: Vec<u8>,
 }
 
+/// One commit from the first-parent log, oldest-first.
+pub struct RawCommit {
+    pub hash: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub timestamp: i64,
+    /// insertions + deletions across the commit's diff
+    pub diff_magnitude: u32,
+    pub is_merge: bool,
+}
+
 pub trait Extractor {
     /// Hash of the HEAD tree (static-mode seed source).
     fn head_tree_hash(&self) -> Result<String>;
     /// All tracked files at HEAD, sorted by path, with blob contents.
     fn files_at_head(&self) -> Result<Vec<RawFile>>;
+    /// Current branch name ("HEAD" when detached).
+    fn head_branch(&self) -> Result<String>;
+    /// Root commit reached by first-parent walk (history-mode identity seed).
+    fn root_commit_hash(&self) -> Result<String>;
+    /// Total first-parent commit count on HEAD.
+    fn first_parent_count(&self) -> Result<u32>;
+    /// First-parent log, chronological (oldest first). `limit` keeps
+    /// the newest N; `range` is a raw git revision range like "A..B".
+    fn first_parent_log(&self, range: Option<&str>, limit: Option<usize>)
+        -> Result<Vec<RawCommit>>;
 }
 
 /// Day-one implementation: shell out to the git binary.
@@ -116,6 +137,85 @@ impl Extractor for ShellGit {
             files.push(RawFile { path, content });
         }
         Ok(files)
+    }
+
+    fn head_branch(&self) -> Result<String> {
+        let out = git(&self.repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        Ok(String::from_utf8(out)?.trim().to_string())
+    }
+
+    fn root_commit_hash(&self) -> Result<String> {
+        let out = git(
+            &self.repo,
+            &["rev-list", "--max-parents=0", "--first-parent", "HEAD"],
+        )
+        .context("repository has no commits yet (no HEAD)")?;
+        let text = String::from_utf8(out)?;
+        text.lines()
+            .last()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .context("could not find a root commit")
+    }
+
+    fn first_parent_count(&self) -> Result<u32> {
+        let out = git(&self.repo, &["rev-list", "--count", "--first-parent", "HEAD"])?;
+        Ok(String::from_utf8(out)?.trim().parse().unwrap_or(0))
+    }
+
+    fn first_parent_log(
+        &self,
+        range: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RawCommit>> {
+        // Records separated by \x01, header fields by \x1f, then
+        // numstat lines until the next record.
+        let mut args: Vec<String> = vec![
+            "log".into(),
+            "--first-parent".into(),
+            "--numstat".into(),
+            "--format=%x01%H%x1f%P%x1f%an%x1f%ae%x1f%at".into(),
+        ];
+        if let Some(n) = limit {
+            args.push("-n".into());
+            args.push(n.to_string());
+        }
+        args.push(range.unwrap_or("HEAD").to_string());
+        let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = git(&self.repo, &argrefs).context("git log failed (bad --range?)")?;
+        let text = String::from_utf8_lossy(&out);
+
+        let mut commits = Vec::new();
+        for record in text.split('\u{01}').skip(1) {
+            let mut lines = record.lines();
+            let header = match lines.next() {
+                Some(h) => h,
+                None => continue,
+            };
+            let fields: Vec<&str> = header.split('\u{1f}').collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let mut magnitude: u64 = 0;
+            for line in lines {
+                let mut cols = line.split('\t');
+                let ins = cols.next().unwrap_or("").trim();
+                let del = cols.next().unwrap_or("").trim();
+                // Binary files show "-"; count them as a small fixed cost.
+                magnitude += ins.parse::<u64>().unwrap_or(if ins == "-" { 8 } else { 0 });
+                magnitude += del.parse::<u64>().unwrap_or(if del == "-" { 8 } else { 0 });
+            }
+            commits.push(RawCommit {
+                hash: fields[0].trim().to_string(),
+                is_merge: fields[1].split_whitespace().count() > 1,
+                author_name: fields[2].trim().to_string(),
+                author_email: fields[3].trim().to_ascii_lowercase(),
+                timestamp: fields[4].trim().parse().unwrap_or(0),
+                diff_magnitude: magnitude.min(u32::MAX as u64) as u32,
+            });
+        }
+        commits.reverse(); // git log is newest-first; the score reads oldest-first
+        Ok(commits)
     }
 }
 
