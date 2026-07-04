@@ -5,10 +5,12 @@
 mod analyze;
 mod compose;
 mod compose_history;
+mod config;
 mod extract;
 mod model;
 mod render;
 mod rng;
+mod synth;
 mod theme;
 mod theory;
 
@@ -83,9 +85,13 @@ struct Shared {
     #[arg(short, long)]
     out: Option<PathBuf>,
 
-    /// Play after rendering (Phase 4, not yet implemented)
+    /// Play after rendering (needs a build with the `playback` feature)
     #[arg(long)]
     play: bool,
+
+    /// SF2 soundfont for WAV rendering/playback (default: embedded TimGM6mb)
+    #[arg(long)]
+    soundfont: Option<PathBuf>,
 
     /// Override the seed (hex), for exploration and debugging
     #[arg(long)]
@@ -152,10 +158,11 @@ fn run() -> Result<()> {
 const COMMIT_CAP: usize = 300;
 
 fn run_history(repo: &Path, shared: &Shared, opts: &HistoryOpts) -> Result<()> {
-    let scale = parse_scale(shared)?;
-
     // extract
     let git = ShellGit::open(repo)?;
+    let cfg = config::load(git.root())?;
+    let scale = parse_scale(shared)?.or(cfg.scale);
+    let bpm = shared.bpm.or(cfg.bpm);
     let root_hash = git.root_commit_hash()?;
     let identity_seed = match &shared.seed {
         Some(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16)
@@ -184,13 +191,10 @@ fn run_history(repo: &Path, shared: &Shared, opts: &HistoryOpts) -> Result<()> {
         analyze::build_folded_model(&fp, identity_seed, branch, total, compress)
     } else {
         // Conflict probe per merge (spec §6.2): merge-tree between
-        // parents, degrading to "clean" on any error.
-        let conflicted: Vec<bool> = raw
-            .iter()
-            .map(|c| {
-                c.parents.len() > 1 && git.merge_conflicted(&c.parents[0], &c.parents[1])
-            })
-            .collect();
+        // parents, degrading to "clean" on any error. Probes are
+        // independent git processes, so run them on a thread pool;
+        // results land by index, keeping output deterministic.
+        let conflicted = probe_conflicts(&git, &raw);
         let head = git.head_commit()?;
         analyze::build_history_model(
             &raw,
@@ -206,11 +210,45 @@ fn run_history(repo: &Path, shared: &Shared, opts: &HistoryOpts) -> Result<()> {
     // compose + render
     let params = ComposeParams {
         scale,
-        bpm: shared.bpm,
+        bpm,
         duration_secs: shared.duration,
     };
     let score = compose::compose(&model, &params);
     write_output(repo, shared, &score)
+}
+
+/// Run `git merge-tree` for every merge commit, fanned out over a few
+/// worker threads (each probe forks a git process; on an 81k-commit
+/// repo a sequential pass dominated render time 8:1).
+fn probe_conflicts(git: &ShellGit, raw: &[extract::RawCommit]) -> Vec<bool> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let jobs: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].parents.len() > 1).collect();
+    let results: Vec<std::sync::atomic::AtomicBool> =
+        (0..raw.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(jobs.len().max(1));
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let j = cursor.fetch_add(1, Ordering::Relaxed);
+                if j >= jobs.len() {
+                    break;
+                }
+                let i = jobs[j];
+                let c = &raw[i];
+                if git.merge_conflicted(&c.parents[0], &c.parents[1]) {
+                    results[i].store(true, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    results.into_iter().map(|b| b.into_inner()).collect()
 }
 
 fn parse_scale(shared: &Shared) -> Result<Option<Scale>> {
@@ -223,10 +261,11 @@ fn parse_scale(shared: &Shared) -> Result<Option<Scale>> {
 }
 
 fn run_static(repo: &Path, shared: &Shared) -> Result<()> {
-    let scale = parse_scale(shared)?;
-
     // extract
     let git = ShellGit::open(repo)?;
+    let cfg = config::load(git.root())?;
+    let scale = parse_scale(shared)?.or(cfg.scale);
+    let bpm = shared.bpm.or(cfg.bpm);
     let tree = git.head_tree_hash()?;
     let seed = match &shared.seed {
         Some(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16)
@@ -246,7 +285,7 @@ fn run_static(repo: &Path, shared: &Shared) -> Result<()> {
     // compose
     let params = ComposeParams {
         scale,
-        bpm: shared.bpm,
+        bpm,
         duration_secs: shared.duration,
     };
     let score = compose::compose(&model, &params);
@@ -255,10 +294,12 @@ fn run_static(repo: &Path, shared: &Shared) -> Result<()> {
 
 fn write_output(repo: &Path, shared: &Shared, score: &model::Score) -> Result<()> {
     let out = output_path(repo, shared)?;
+    let midi = render::render_midi(score)?;
+    let soundfont = shared.soundfont.as_deref();
     let bytes = match out.extension().and_then(|e| e.to_str()) {
-        Some("mid") | Some("midi") => render::render_midi(score)?,
-        Some("wav") => bail!("WAV rendering is Phase 4 and not implemented yet; use .mid"),
-        _ => bail!("unsupported output extension (use .mid)"),
+        Some("mid") | Some("midi") => midi.clone(),
+        Some("wav") => synth::render_wav(&midi, soundfont)?,
+        _ => bail!("unsupported output extension (use .mid or .wav)"),
     };
     std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
 
@@ -285,7 +326,12 @@ fn write_output(repo: &Path, shared: &Shared, score: &model::Score) -> Result<()
         score.seed
     );
     if shared.play {
-        eprintln!("note: --play is Phase 4 and not implemented yet");
+        let (left, right) = synth::synthesize(&midi, soundfont)?;
+        if let Err(e) = synth::play(left, right) {
+            // The file is already on disk; a missing audio backend
+            // should not turn a successful render into a failure.
+            eprintln!("gitfugue: {e}");
+        }
     }
     Ok(())
 }
@@ -303,8 +349,7 @@ fn output_path(repo: &Path, shared: &Shared) -> Result<PathBuf> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "gitfugue".to_string());
     match shared.format.as_str() {
-        "mid" => Ok(PathBuf::from(format!("{name}.mid"))),
-        "wav" => bail!("WAV rendering is Phase 4 and not implemented yet"),
+        "mid" | "wav" => Ok(PathBuf::from(format!("{name}.{}", shared.format))),
         other => bail!("unknown format '{other}' (mid | wav)"),
     }
 }

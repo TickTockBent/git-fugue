@@ -74,6 +74,11 @@ impl ShellGit {
         }
         Ok(ShellGit { repo: PathBuf::from(top) })
     }
+
+    /// Repository toplevel (where .gitfugue.toml lives).
+    pub fn root(&self) -> &Path {
+        &self.repo
+    }
 }
 
 impl Extractor for ShellGit {

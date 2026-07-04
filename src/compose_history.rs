@@ -264,10 +264,11 @@ pub fn compose_history(
         }
 
         // Conflicted merge: one bar of suspension first (spec §6.2).
-        if commit.is_merge && commit.conflicted && commit.closes_lane.is_some() {
-            let src = commit.closes_lane.unwrap() as usize;
+        if commit.is_merge && commit.conflicted
+            && let Some(src) = commit.closes_lane
+        {
             liner.push(format!("bar {}: conflict tension", bar_no(tick)));
-            suspension_bar(&mut notes, &lanes, lane, src, tick, key, scale);
+            suspension_bar(&mut notes, &lanes, lane, src as usize, tick, key, scale);
             tick += BAR;
         }
 
@@ -354,7 +355,7 @@ pub fn compose_history(
             }
             comp_bar(&mut notes, lv, l, tick, key, scale, lead_slot0);
         }
-        if ensemble_active && !on_ensemble && ensemble_voice.is_some() {
+        if ensemble_active && !on_ensemble && let Some(ens) = ensemble_voice {
             let lv = LaneVoice {
                 theme: ensemble_theme.clone(),
                     bars_played: 0,
@@ -362,7 +363,7 @@ pub fn compose_history(
                 current_program: ENSEMBLE.0,
                 name: String::new(),
             };
-            comp_bar(&mut notes, &lv, ensemble_voice.unwrap(), tick, key, scale, lead_slot0);
+            comp_bar(&mut notes, &lv, ens, tick, key, scale, lead_slot0);
         }
 
         tick += BAR;

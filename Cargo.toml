@@ -1,12 +1,15 @@
 [package]
 name = "gitfugue"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 midly = "0.5.3"
+rodio = { version = "0.22.2", default-features = false, features = ["playback"], optional = true }
+rustysynth = "1.3.6"
+toml = "1.1.2"
 tree-sitter = "0.26.10"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
@@ -14,3 +17,8 @@ tree-sitter-rust = "0.24.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[features]
+# Audio playback needs an audio backend (ALSA headers on Linux):
+#   cargo build --features playback
+playback = ["dep:rodio"]

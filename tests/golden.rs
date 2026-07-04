@@ -264,6 +264,62 @@ fn history_liner_notes_name_the_players() {
 }
 
 #[test]
+fn repo_config_pins_scale_and_bpm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("cfgfix");
+    std::fs::create_dir(&repo).unwrap();
+    build_fixture(&repo);
+    // Committed or not, the config at the repo root applies.
+    std::fs::write(repo.join(".gitfugue.toml"), "scale = \"aeolian\"\nbpm = 77\n").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_gitfugue");
+    let out = Command::new(exe)
+        .args(["static"])
+        .arg(&repo)
+        .args(["--verbose", "-o"])
+        .arg(tmp.path().join("cfg.mid"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("aeolian") && text.contains("bpm: 77"), "config ignored:\n{text}");
+
+    // CLI flags still win over the file.
+    let out = Command::new(exe)
+        .args(["static"])
+        .arg(&repo)
+        .args(["--bpm", "101", "--verbose", "-o"])
+        .arg(tmp.path().join("cfg2.mid"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("bpm: 101"), "CLI flag lost to config:\n{text}");
+}
+
+#[test]
+fn wav_output_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("wavfix");
+    std::fs::create_dir(&repo).unwrap();
+    build_fixture(&repo);
+
+    let exe = env!("CARGO_BIN_EXE_gitfugue");
+    let wav_path = tmp.path().join("song.wav");
+    let status = Command::new(exe)
+        .args(["static"])
+        .arg(&repo)
+        .args(["--duration", "20", "-o"])
+        .arg(&wav_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let wav = std::fs::read(&wav_path).unwrap();
+    assert_eq!(&wav[..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert!(wav.len() > 500_000, "20s of audio expected, got {} bytes", wav.len());
+}
+
+#[test]
 fn seed_override_changes_output() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("fixture");

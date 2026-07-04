@@ -49,9 +49,22 @@ Full design: [gitfugue-spec.md](gitfugue-spec.md).
 - Standard MIDI file output with engine version + seed in the metadata
 - Golden byte-identical determinism test in CI-able form
 
-Phases 1 (static mode) and 2 remain as described below. Not yet
-built: WAV/playback, embedded soundfont, and `.gitfugue.toml`
-(Phase 4).
+**Phase 4 (sound and polish) is implemented:**
+
+- WAV rendering via rustysynth with an embedded TimGM6mb soundfont
+  (~6 MB, GPL-2.0 — see assets/SOUNDFONT-LICENSE.md); `-o song.wav`
+  or `--format wav` just works, `--soundfont` swaps in any SF2
+- `--play` plays the rendered piece (build with
+  `cargo build --features playback`; needs an audio backend such as
+  ALSA headers on Linux)
+- `.gitfugue.toml` at the repo root pins `scale` and `bpm`; CLI flags
+  still win. Repos choose their own sound, and it ships with the code
+- Perf pass: merge-tree conflict probes run on a thread pool
+  (git/git's 300-commit window: 8.7s -> 3.9s, under the spec's 5s
+  target)
+
+Remaining from the spec: the Phase 4 stretch goals (`gitfugue watch`,
+CI artifact mode) and the hybrid static+history mode (open question 1).
 
 ## Usage
 
@@ -61,7 +74,10 @@ gitfugue static [PATH]       # the code at HEAD is the score
 gitfugue history [PATH]      # the commit history is the score
 
 Shared flags:
-  -o, --out FILE        output path (default: <repo-name>.mid)
+  -o, --out FILE        output path; format by extension (.mid | .wav)
+      --format mid|wav  output format when --out is not given
+      --play            play after rendering (playback-feature builds)
+      --soundfont FILE  SF2 for WAV/playback (default: embedded TimGM6mb)
       --seed HEX        override the seed (exploration/debugging)
       --scale NAME      pentatonic | minor-pentatonic | dorian | aeolian
       --bpm N           override base tempo
@@ -100,8 +116,17 @@ wrote charlotte.mid (312 bars, E major pentatonic, 71 bpm, 6 voices, seed fb328a
 ## Building
 
 ```
-cargo build --release
-cargo test            # includes the golden determinism test
+cargo build --release                      # MIDI + WAV rendering
+cargo build --release --features playback  # + --play (needs ALSA/CoreAudio)
+cargo test                                 # includes the golden determinism tests
+```
+
+Repo config (committed alongside the code):
+
+```toml
+# .gitfugue.toml
+scale = "minor-pentatonic"
+bpm = 84
 ```
 
 After an *intentional* engine change that alters output, bump the crate
